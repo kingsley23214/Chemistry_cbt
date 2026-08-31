@@ -2,6 +2,12 @@ from flask import Flask, request, session, redirect, url_for, render_template_st
 from datetime import datetime, timezone
 import sqlite3
 import os
+import requests
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 # ============================================================
 # APP SETTINGS
@@ -16,9 +22,33 @@ app.secret_key = os.environ.get(
     "CHANGE-THIS-TO-A-LONG-RANDOM-SECRET-KEY"
 )
 
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER"))
+)
+
 EXAM_TIME = 30 * 60  # 30 minutes
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 DATABASE = os.environ.get("DATABASE_PATH", "cbt_results.db")
+
+# WhatsApp Cloud API settings. Keep these in Render Environment Variables.
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_RECIPIENT = os.environ.get("WHATSAPP_RECIPIENT", "").strip()
+WHATSAPP_TEMPLATE_NAME = os.environ.get(
+    "WHATSAPP_TEMPLATE_NAME",
+    "cbt_result_notification"
+).strip()
+WHATSAPP_TEMPLATE_LANGUAGE = os.environ.get(
+    "WHATSAPP_TEMPLATE_LANGUAGE",
+    "en_US"
+).strip()
+WHATSAPP_API_VERSION = os.environ.get(
+    "WHATSAPP_API_VERSION",
+    "v23.0"
+).strip()
 
 
 # ============================================================
@@ -523,38 +553,242 @@ QUESTIONS = [
 # DATABASE
 # ============================================================
 
+def using_postgres():
+    return bool(DATABASE_URL)
+
+
 def get_db():
+    """Use Render PostgreSQL online; use SQLite locally if DATABASE_URL is absent."""
+    if DATABASE_URL:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2-binary is required when DATABASE_URL is set."
+            )
+        return psycopg2.connect(DATABASE_URL)
+
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
     return connection
 
 
 def create_database():
-
     connection = get_db()
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS results (
-
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            student_name TEXT NOT NULL,
-
-            score INTEGER NOT NULL,
-
-            total_questions INTEGER NOT NULL,
-
-            percentage REAL NOT NULL,
-
-            time_used INTEGER NOT NULL,
-
-            submitted_at TEXT NOT NULL
-
-        )
-    """)
+    if using_postgres():
+        cursor = connection.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                id SERIAL PRIMARY KEY,
+                student_name TEXT NOT NULL,
+                login_at TEXT NOT NULL,
+                submitted_at TEXT,
+                score INTEGER,
+                total_questions INTEGER,
+                percentage REAL,
+                time_used INTEGER,
+                submission_type TEXT
+            )
+        """)
+    else:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_name TEXT NOT NULL,
+                login_at TEXT NOT NULL,
+                submitted_at TEXT,
+                score INTEGER,
+                total_questions INTEGER,
+                percentage REAL,
+                time_used INTEGER,
+                submission_type TEXT
+            )
+        """)
 
     connection.commit()
     connection.close()
+
+
+def create_attempt(student_name):
+    login_at = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    connection = get_db()
+
+    if using_postgres():
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            INSERT INTO attempts (student_name, login_at)
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (student_name, login_at)
+        )
+        attempt_id = cursor.fetchone()[0]
+    else:
+        cursor = connection.execute(
+            """
+            INSERT INTO attempts (student_name, login_at)
+            VALUES (?, ?)
+            """,
+            (student_name, login_at)
+        )
+        attempt_id = cursor.lastrowid
+
+    connection.commit()
+    connection.close()
+    return attempt_id, login_at
+
+
+def save_attempt_result(
+    attempt_id,
+    score,
+    total,
+    percentage,
+    time_used,
+    submitted_at,
+    submission_type
+):
+    connection = get_db()
+
+    if using_postgres():
+        connection.cursor().execute(
+            """
+            UPDATE attempts
+            SET submitted_at = %s,
+                score = %s,
+                total_questions = %s,
+                percentage = %s,
+                time_used = %s,
+                submission_type = %s
+            WHERE id = %s
+            """,
+            (
+                submitted_at,
+                score,
+                total,
+                percentage,
+                time_used,
+                submission_type,
+                attempt_id
+            )
+        )
+    else:
+        connection.execute(
+            """
+            UPDATE attempts
+            SET submitted_at = ?,
+                score = ?,
+                total_questions = ?,
+                percentage = ?,
+                time_used = ?,
+                submission_type = ?
+            WHERE id = ?
+            """,
+            (
+                submitted_at,
+                score,
+                total,
+                percentage,
+                time_used,
+                submission_type,
+                attempt_id
+            )
+        )
+
+    connection.commit()
+    connection.close()
+
+
+def send_whatsapp_notification(
+    student_name,
+    score,
+    total,
+    percentage,
+    login_at,
+    submitted_at,
+    time_used,
+    submission_type
+):
+    """
+    Send a WhatsApp template message to the administrator.
+    It stays disabled until the WhatsApp environment variables are set.
+    """
+    if not (
+        WHATSAPP_ACCESS_TOKEN
+        and WHATSAPP_PHONE_NUMBER_ID
+        and WHATSAPP_RECIPIENT
+    ):
+        print(
+            "WhatsApp notification skipped: "
+            "WhatsApp environment variables are not configured."
+        )
+        return
+
+    url = (
+        f"https://graph.facebook.com/"
+        f"{WHATSAPP_API_VERSION}/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
+
+    submission_label = (
+        "Automatic (time expired)"
+        if submission_type == "automatic"
+        else "Manual"
+    )
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": WHATSAPP_RECIPIENT,
+        "type": "template",
+        "template": {
+            "name": WHATSAPP_TEMPLATE_NAME,
+            "language": {
+                "code": WHATSAPP_TEMPLATE_LANGUAGE
+            },
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": student_name},
+                        {"type": "text", "text": f"{score}/{total}"},
+                        {"type": "text", "text": f"{percentage:.1f}%"},
+                        {"type": "text", "text": login_at},
+                        {"type": "text", "text": submitted_at},
+                        {"type": "text", "text": time_used},
+                        {"type": "text", "text": submission_label}
+                    ]
+                }
+            ]
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+
+        if response.ok:
+            print("WhatsApp notification sent successfully.")
+        else:
+            print(
+                "WhatsApp notification failed:",
+                response.status_code,
+                response.text
+            )
+
+    except Exception as error:
+        # Never prevent the student's result from being saved.
+        print("WhatsApp notification error:", error)
 
 
 # ============================================================
@@ -1895,7 +2129,20 @@ Your examination was submitted automatically because your time expired.
 <div class="result-row">
 
 <span>
-    Date
+    Login Time
+</span>
+
+<strong>
+    {{ login_at }}
+</strong>
+
+</div>
+
+
+<div class="result-row">
+
+<span>
+    Submission Time
 </span>
 
 <strong>
@@ -1955,6 +2202,10 @@ def login():
 
         session["student_name"] = student_name
 
+        # Record the student's login immediately.
+        attempt_id, login_at = create_attempt(student_name)
+        session["attempt_id"] = attempt_id
+        session["login_at"] = login_at
 
         session["started_at"] = current_timestamp()
 
@@ -2140,45 +2391,40 @@ def submit_exam():
     # SAVE RESULT
     # ----------------------------------------
 
-    submitted_at = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-
-    connection = get_db()
-
-
-    connection.execute(
-        """
-        INSERT INTO results
-        (
-            student_name,
-            score,
-            total_questions,
-            percentage,
-            time_used,
-            submitted_at
-        )
-
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-
-        (
-            student_name,
-            score,
-            total,
-            percentage,
-            time_used,
-            submitted_at
-        )
+    submitted_at = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
     )
 
+    submission_type = (
+        "automatic"
+        if auto_submit
+        else "manual"
+    )
 
-    connection.commit()
+    attempt_id = session.get("attempt_id")
 
+    if attempt_id:
+        save_attempt_result(
+            attempt_id=attempt_id,
+            score=score,
+            total=total,
+            percentage=percentage,
+            time_used=time_used,
+            submitted_at=submitted_at,
+            submission_type=submission_type
+        )
 
-    connection.close()
-
+    # Notify the administrator after the result is safely saved.
+    send_whatsapp_notification(
+        student_name=student_name,
+        score=score,
+        total=total,
+        percentage=percentage,
+        login_at=session.get("login_at", ""),
+        submitted_at=submitted_at,
+        time_used=format_time(time_used),
+        submission_type=submission_type
+    )
 
     # ----------------------------------------
     # STORE RESULT IN SESSION
@@ -2200,6 +2446,9 @@ def submit_exam():
 
         "submitted_at":
             submitted_at,
+
+        "login_at":
+            session.get("login_at", ""),
 
         "auto_submit":
             auto_submit
@@ -2270,24 +2519,21 @@ def health():
 # START APPLICATION
 # ============================================================
 
+# Initialize the database when Gunicorn imports this module on Render.
+create_database()
+
+
 if __name__ == "__main__":
 
-    create_database()
-
-
     port = int(
-            os.environ.get(
-                "PORT",
-                5000
-            )
+        os.environ.get(
+            "PORT",
+            5000
         )
-
+    )
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
-        debug=True
+        debug=os.environ.get("FLASK_DEBUG", "0") == "1"
     )
